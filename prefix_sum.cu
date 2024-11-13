@@ -21,7 +21,7 @@ static constexpr int bank_width_int32 = 768;
 static constexpr int sh_mem_size = num_banks * bank_width_int32;
 
 // Device function. Shift an index to avoid bank conflicts
-__device__ int shifted_idx (int idx)
+__inline__ __device__ int shifted_idx (int idx)
 {
     int idx_idiv_num_banks = idx;
     int idx_mod_num_banks = idx % num_banks;
