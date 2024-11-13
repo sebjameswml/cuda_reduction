@@ -1,4 +1,5 @@
 #include <cmath>
+#include <limits>
 #include <vector>
 #include <iostream>
 #include <cuda.h>
@@ -16,16 +17,13 @@ __device__ int shifted_idx (int idx)
     return offs_idx;
 }
 
-// This should work - it comes from my PyCuda implementation in VisualAttention and was fairly easy to convert to C
-__global__ void reduceit (float* scan_ar_, float* input_ar_, float* carry_, int n, int arraysz)
+// Apply a prefix sum algorithm to input_ar_, reducing it to scan_ar_ and carry_.
+// does threadsperblock_ need to be an arg? Isn't that always blockDim.x?
+__global__ void reduceit (float* scan_ar_, float* input_ar_, float* carry_, int threadsperblock_, int arraysz)
 {
-    // Access thread/block/grid info like this:
-    // int i = threadIdx.x + (blockIdx.x * blockDim.x) + (blockIdx.y * blockDim.x * gridDim.x);
-
     int thid = threadIdx.x;
     int tb_offset = blockIdx.x * blockDim.x; // threadblock offset
-    //int d = n / 2; // Integer division
-    int d = n >> 1;
+    int d = threadsperblock_ >> 1;
 
     // This runs for every element in input_ar_
     if ((thid + tb_offset) < (arraysz - d)) {
@@ -57,21 +55,15 @@ __global__ void reduceit (float* scan_ar_, float* input_ar_, float* carry_, int 
                 bi_s = shifted_idx(bi);
                 temp[bi_s] += temp[ai_s];
             }
-            offset *= 2;
+            offset <<= 1;
             d >>= 1;
 
         }
         __syncthreads();
-#if 0
-        // DEBUG
-        scan_ar_[ai] = (float)bi_s;
-
-    }
-#else
 
         // Block C: clear the last element - the first step of the downsweep
         if (thid == 0) {
-            int nm1s = shifted_idx (n - 1);
+            int nm1s = shifted_idx (threadsperblock_ - 1);
             // Carry last number in the block
             carry_[blockIdx.x] = temp[nm1s];
             temp[nm1s] = 0;
@@ -79,7 +71,7 @@ __global__ void reduceit (float* scan_ar_, float* input_ar_, float* carry_, int 
 
         // Downsweep: traverse down tree & build scan
         d = 1;
-        while (d < n) {
+        while (d < threadsperblock_) {
             offset >>= 1;
             __syncthreads();
             if (thid < d) {
@@ -98,9 +90,8 @@ __global__ void reduceit (float* scan_ar_, float* input_ar_, float* carry_, int 
 
         // Block E: write results to device memory
         scan_ar_[ai + tb_offset] = temp[ai_s];
-        if (bi < n) { scan_ar_[bi + tb_offset] = temp[bi_s]; }
+        if (bi < threadsperblock_) { scan_ar_[bi + tb_offset] = temp[bi_s]; }
     }
-#endif
     __syncthreads();
 }
 
@@ -122,7 +113,6 @@ __global__ void sum_scans (float* new_carry_ar_, float* scan_ar_, int scan_ar_sz
 // threads per block. Return result in r_scanf_ar.
 __host__ void prefixsum_gpu (float* d_weight_ar, int rowlen, int threadsperblock, std::vector<float>& r_scanf_ar)
 {
-    std::cout << __func__ << " called" << std::endl;
     // Build input data for the test
     int arraysz = rowlen * rowlen;
     int blockspergrid = std::ceil (static_cast<float>(arraysz) / static_cast<float>(threadsperblock));
@@ -136,14 +126,12 @@ __host__ void prefixsum_gpu (float* d_weight_ar, int rowlen, int threadsperblock
     float* d_scan_ar = nullptr;
     cudaMalloc (&d_scan_ar, arrayszplus * sizeof(float));
     cudaMemcpy (d_scan_ar, scan_ar.data(), arrayszplus * sizeof(float), cudaMemcpyHostToDevice);
-    std::cout << __func__ << " alloced d_scan_ar" << std::endl;
 #if 1
     // scanf_ar is a data structure to hold the final, corrected scan (was uint, but no longer). Prolly can be d_scan_ar
     float* d_scanf_ar = nullptr;
     std::vector<float> scanf_ar (arrayszplus, 0.0f);
     cudaMalloc (&d_scanf_ar, arrayszplus * sizeof(float));
     cudaMemcpy (d_scanf_ar, scanf_ar.data(), arrayszplus * sizeof(float), cudaMemcpyHostToDevice);
-    std::cout << __func__ << " alloced d_scanf_ar" << std::endl;
 #endif
     // Make up a list of carry vectors and allocate device memory
     std::vector<std::vector<float>> carrylist;
@@ -162,12 +150,10 @@ __host__ void prefixsum_gpu (float* d_weight_ar, int rowlen, int threadsperblock
         // This is: d_carrylist.append (cuda.to_device(carrylist[-1])); // end of carrylist carrylist.back()
         float* d_cl = nullptr;
         cudaMalloc (&d_cl, carrysz * sizeof(float));
-        std::cout << __func__ << " alloced a d_carrylist entry with carrysz " << carrysz << std::endl;
         cudaMemcpy (d_cl, carrylist.back().data(), carrysz * sizeof(float), cudaMemcpyHostToDevice);
         d_carrylist.push_back (d_cl);
 
         asz = std::ceil (asz / threadsperblock);
-        std::cout << "asz = " << asz << std::endl;
         int scansz = asz;
         if (scansz % threadsperblock) { scansz = scansz + threadsperblock - scansz % threadsperblock; }
 
@@ -176,11 +162,9 @@ __host__ void prefixsum_gpu (float* d_weight_ar, int rowlen, int threadsperblock
         // This is: d_scanlist.append (cuda.to_device(scanlist[-1]));
         float* d_sl = nullptr;
         cudaMalloc (&d_sl, scansz * sizeof(float));
-        std::cout << __func__ << " alloced a d_scanlist entry with scansz " << scansz << std::endl;
         cudaMemcpy (d_sl, scanlist.back().data(), scansz * sizeof(float), cudaMemcpyHostToDevice);
         d_scanlist.push_back (d_sl);
     }
-    std::cout << "d_carrylist has " << d_carrylist.size() << " entries and d_scanlist has " << d_scanlist.size() << std::endl;
     // Add a last carrylist, as this will be required as a dummy carry list for the last call to reduceit()
     carrylist.push_back (std::vector<float>(1, 0.0f));
     float* d_cl = nullptr;
@@ -190,28 +174,11 @@ __host__ void prefixsum_gpu (float* d_weight_ar, int rowlen, int threadsperblock
 
     cudaDeviceSynchronize();
     //
-    // Compute partial scans of the top-level weight_ar and the lower level
-    // partial sums
+    // Compute partial scans of the top-level weight_ar and the lower level partial sums
     //
     // The first input is the weight array, compute block-wise prefix-scan sums:
-    std::cout << "reduceit<<<" << blockspergrid << ", " << threadsperblock << ", "
-              << (threadsperblock * sizeof(float)) << ">>>\n";
     reduceit<<<blockspergrid, threadsperblock, 12288 * sizeof(float)>>>(d_scan_ar, d_weight_ar, d_carrylist[0], threadsperblock, arrayszplus);
     cudaDeviceSynchronize();
-    std::cout << "reduceit synchronized" << std::endl; // If fails to show, reduceit failed.
-
-    // Debug what reduceit did
-    std::vector<float> debug_ar (arrayszplus, 0.0f);
-    cudaMemcpy (debug_ar.data(), d_scan_ar, arrayszplus * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaDeviceSynchronize();
-    float dsmax = 0.0f;
-    for (int i = 0; i < arrayszplus; ++i) {
-        if (i < 16) {
-            std::cout << "d_scan_ar:  " << debug_ar[i] << std::endl;
-        }
-        dsmax = debug_ar[i] > dsmax ? debug_ar[i] : dsmax;
-    }
-    std::cout << "dsmax is " << dsmax << std::endl;
 
     asz = std::ceil (arrayszplus / threadsperblock);
     int j = 0;
@@ -219,9 +186,8 @@ __host__ void prefixsum_gpu (float* d_weight_ar, int rowlen, int threadsperblock
     while (asz > threadsperblock) {
         scanblocks = std::ceil (asz / threadsperblock);
         scanblocks = scanblocks + threadsperblock - scanblocks % threadsperblock;
-        std::cout << "scanblocks reduceit<<<" << scanblocks << ", " << threadsperblock << ", "
-                  << (threadsperblock * sizeof(float))<< ">>>\n";
         reduceit<<<scanblocks, threadsperblock, 12288 * sizeof(float)>>>(d_scanlist[j], d_carrylist[j], d_carrylist[j+1], threadsperblock, carrylist[j].size());
+        cudaDeviceSynchronize();
         asz = scanblocks;
         j++;
     }
@@ -229,14 +195,14 @@ __host__ void prefixsum_gpu (float* d_weight_ar, int rowlen, int threadsperblock
     scanblocks = std::ceil (asz / threadsperblock);
     scanblocks = scanblocks + threadsperblock - scanblocks % threadsperblock;
     reduceit<<<scanblocks, threadsperblock, 12288 * sizeof(float)>>>(d_scanlist[j], d_carrylist[j], d_carrylist[j+1], threadsperblock, carrylist[j].size());
-    std::cout << "final scanblocks reduceit<<<" << scanblocks << ", " << threadsperblock << ", "
-              << (threadsperblock * sizeof(float))<< ">>>\n";
+    cudaDeviceSynchronize();
 
     // Construct the scans back up the tree by summing the "carry" into the "scans"
     j = static_cast<int>(scanlist.size());
     while (j > 0) {
         int sumblocks = std::ceil( scanlist[j-1].size() / threadsperblock );
         sum_scans<<<sumblocks, threadsperblock>>>(d_carrylist[j-1], d_scanlist[j-1], scanlist[j-1].size(), d_carrylist[j]);
+        cudaDeviceSynchronize();
         // Now d_carrylist[j-1] has had its carrys added from the lower level
         j--;
     }
@@ -247,11 +213,8 @@ __host__ void prefixsum_gpu (float* d_weight_ar, int rowlen, int threadsperblock
     if (r_scanf_ar.size() != arrayszplus) {
         std::cerr << "Can't fill r_scanf_ar with result :L(\n";
     } else {
-        std::cout << "Copy to r_scanf_ar...\n";
-        //cudaMemcpy (r_scanf_ar.data(), d_scanf_ar, arrayszplus * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy (r_scanf_ar.data(), d_scanf_ar, arrayszplus * sizeof(float), cudaMemcpyDeviceToHost);
     }
-
-    std::cout << "End of prefixsum_gpu\n";
 }
 
 int main()
@@ -310,6 +273,9 @@ int main()
         weight_ar[22486] = 2.54f;
     }
 
+    float cpu_sum = 0.0f;
+    for (auto w : weight_ar) { cpu_sum += w; }
+
     // Copy to GPU memory:
     float* d_weight_ar = nullptr;
     cudaMalloc (&d_weight_ar, arrayszplus * sizeof(float));
@@ -329,7 +295,7 @@ int main()
     std::vector<float> r_scanf_ar(arrayszplus);
     prefixsum_gpu (d_weight_ar, rowlen, threadsperblock, r_scanf_ar);
 
-#if 0
+#ifdef DEBUG_ALL_VALUES
     // Print result
     unsigned int j = 0;
     while (j < arraysz) {
@@ -337,5 +303,13 @@ int main()
         ++j;
     }
 #endif
+
+    if (std::abs(r_scanf_ar[arraysz-1] - cpu_sum) > 2 * cpu_sum * std::numeric_limits<float>::epsilon() ) {
+        std::cerr << "FAIL r_scanf_ar[arraysz-1] != cpu_sum: " << r_scanf_ar[arraysz-1] << "!=" << cpu_sum
+                  << " delta is " << (std::abs(r_scanf_ar[arraysz-1] - cpu_sum) / std::numeric_limits<float>::epsilon())
+                  << " epsilons\n";
+    } else {
+        std::cout << "Array sum is " << r_scanf_ar[arraysz-1] << "\n";
+    }
     return 0;
 }
