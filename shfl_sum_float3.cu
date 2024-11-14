@@ -18,9 +18,9 @@ static constexpr unsigned int all_in_warp = 0xffffffff;
 __inline__ __device__ float3 warpReduceSum (float valR, float valG, float valB)
 {
     for (int offset = warpSize/2; offset > 0; offset >>= 1) {
-        valR += __shfl_down_sync(all_in_warp, valR, offset);
-        valG += __shfl_down_sync(all_in_warp, valG, offset);
-        valB += __shfl_down_sync(all_in_warp, valB, offset);
+        valR += __shfl_down_sync (all_in_warp, valR, offset);
+        valG += __shfl_down_sync (all_in_warp, valG, offset);
+        valB += __shfl_down_sync (all_in_warp, valB, offset);
     }
     return make_float3 (valR, valG, valB);
 }
@@ -31,8 +31,8 @@ __inline__ __device__ float3 blockReduceSum (float3 val)
     int lane = threadIdx.x % warpSize;
     int wid = threadIdx.x / warpSize;
     val = warpReduceSum (val.x, val.y, val.z); // Each warp performs partial reduction
-    if (lane == 0) { shared[wid] = val; }  // Write reduced value to shared memory
-    __syncthreads();                       // Wait for all partial reductions
+    if (lane == 0) { shared[wid] = val; }      // Write reduced value to shared memory
+    __syncthreads();                           // Wait for all partial reductions
     // read from shared memory only if that warp existed
     val = (threadIdx.x < blockDim.x / warpSize) ? shared[lane] : make_float3(0.0f, 0.0f, 0.0f);
     if (wid == 0) { val = warpReduceSum (val.x, val.y, val.z); } // Final reduce within first warp
@@ -44,21 +44,40 @@ __global__ void reduceit (float3* in, float3* out, int N)
 {
     float3 sum = make_float3(0.0f, 0.0f, 0.0f);
     // reduce multiple elements per thread
+    // blockIdx.x * blockDim.x takes us along the array to our own thread block.
+    // Adding thread idx gets us to *the first memory location for this thread*; i.
+    // The other memory locations that this thread deals wtih are spaced by 1024 * 512 = 524288. N is 5242880, so for arrayblocks = 10240, this reduceit will loop 10 times here and add to the sum for 10 widely spaced locations.
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += blockDim.x * gridDim.x) {
         sum.x += in[i].x;
         sum.y += in[i].y;
         sum.z += in[i].z;
     }
-    sum = blockReduceSum (sum);
+
+    // The blockReduceSum function call is called in each thread and sums up the already slightly
+    // reduced numbers, with warps of threads co-operating via shuffle calls.
+    sum = blockReduceSum (sum); // 1 per thread, sums float3 at a time
     if (threadIdx.x == 0) { out[blockIdx.x] = sum; }
 }
 
 __host__ void shufflesum_gpu_work (float3* in, float3* out, int N)
 {
-    int threads = threadsperblock;
-    int blocks = min((N + threads - 1) / threads, 1024);
-    reduceit<<<blocks, threads>>>(in, out, N);
-    reduceit<<<1, 1024>>>(out, out, blocks);
+    int threads = threadsperblock; // 1024 max
+    int gridblocks = min((N + threads - 1) / threads, 1024);
+    dim3 gridblcks(gridblocks);  // as many as you like (more or less)
+    dim3 thrds(threads); // product of thrds should be <= 1024
+    std::cout << "grid will be make of: " << gridblcks.x << " x " << gridblcks.y
+              << " blocks  and each block contains "  << thrds.x << " x " << thrds.y << " threads\n";
+    std::cout << "N is " << N << std::endl;
+
+    std::cout << "reduceit (thread 0, block 0) will serially sum elements ";
+    for (int i = 0 * blockDim.x + 0; i < N; i += thrds.x * gridblcks.x) {
+        std::cout << i << ", ";
+    }
+    std::cout << "\n";
+
+    reduceit<<<gridblcks, thrds>>>(in, out, N);
+
+    reduceit<<<1, 1024>>>(out, out, gridblocks);
 }
 
 __host__ float3 shufflesum_gpu (float3* d_weight_ar, int arraysz)
@@ -91,14 +110,14 @@ int main()
             weight_ar[i] = make_float3 (-3.02f, 1.03f, -1.4f);
         }
     }
-
+#if 0
     float3 cpu_sum = make_float3 (0.0f, 0.0f, 0.0f);
     for (auto w : weight_ar) {
         cpu_sum.x += w.x;
         cpu_sum.y += w.y;
         cpu_sum.z += w.z;
     }
-
+# if 0
     // Copy to GPU memory:
     float3* d_weight_ar = nullptr;
     cudaMalloc (&d_weight_ar, arraysz * 3 * sizeof(float));
@@ -109,6 +128,19 @@ int main()
 
     std::cout << "GPU array sum is (" << gpu_sum.x << "," << gpu_sum.y << "," << gpu_sum.z << ")."
               << " CPU array sum is " << cpu_sum.x << "," << cpu_sum.y << "," << cpu_sum.z << "\n";
+# else
+    std::cout << " CPU array sum is " << cpu_sum.x << "," << cpu_sum.y << "," << cpu_sum.z << "\n";
+# endif
+#else
+    // Copy to GPU memory:
+    float3* d_weight_ar = nullptr;
+    cudaMalloc (&d_weight_ar, arraysz * 3 * sizeof(float));
+    cudaMemcpy (d_weight_ar, weight_ar.data(), arraysz * 3 * sizeof(float), cudaMemcpyHostToDevice);
 
+    // Call the function:
+    float3 gpu_sum = shufflesum_gpu (d_weight_ar, arraysz);
+    std::cout << "GPU array sum is (" << gpu_sum.x << "," << gpu_sum.y << "," << gpu_sum.z << ").\n";
+
+#endif
     return 0;
 }
