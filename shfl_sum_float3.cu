@@ -61,19 +61,11 @@ __host__ void shufflesum_gpu_work (float3* in, float3* out, int N)
 
 __host__ float3 shufflesum_gpu (float3* d_weight_ar, int arraysz)
 {
-    // scanf_ar is a data structure to hold the final sum.
     float3* d_scanf_ar = nullptr;
     cudaMalloc (&d_scanf_ar, arraysz * 3 * sizeof(float));
-    // set to zero (no need)
-    //std::vector<float3> scanf_ar (arraysz, 0.0f);
-    //cudaMemcpy (d_scanf_ar, scanf_ar.data(), arraysz * 3 * sizeof(float), cudaMemcpyHostToDevice);
-
     shufflesum_gpu_work (d_weight_ar, d_scanf_ar, arraysz);
-
-    // This seems to be the way to get the sum:
     float3 sum;
     cudaMemcpy(&sum, d_scanf_ar, 3 * sizeof(float), cudaMemcpyDeviceToHost);
-
     return sum;
 }
 
