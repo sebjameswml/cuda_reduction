@@ -11,14 +11,16 @@
 static constexpr int arrayblocks = 10240;
 // How many threads per block to specify.
 static constexpr int threadsperblock = 512;
+// Mask for __shfl_down_sync
+static constexpr unsigned int all_in_warp = 0xffffffff;
 
 // In each warp reduce three values per thread
 __inline__ __device__ float3 warpReduceSum (float valR, float valG, float valB)
 {
     for (int offset = warpSize/2; offset > 0; offset >>= 1) {
-        valR += __shfl_down_sync(0xffffffff, valR, offset);
-        valG += __shfl_down_sync(0xffffffff, valG, offset);
-        valB += __shfl_down_sync(0xffffffff, valB, offset);
+        valR += __shfl_down_sync(all_in_warp, valR, offset);
+        valG += __shfl_down_sync(all_in_warp, valG, offset);
+        valB += __shfl_down_sync(all_in_warp, valB, offset);
     }
     return make_float3 (valR, valG, valB);
 }
