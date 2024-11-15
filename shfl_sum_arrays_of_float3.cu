@@ -10,9 +10,9 @@
 // How many arrays to sum?
 static constexpr int number_of_arrays = 32;
 // How many elements per array? May be > or < threadsperblock
-static constexpr int elements_per_array = 32;
+static constexpr int elements_per_array = 1024;
 // Ideal number of threads per block
-// static constexpr int threadsperblock = 512;
+static constexpr int threadsperblock = 512;
 // Mask for __shfl_down_sync
 static constexpr unsigned int all_in_warp = 0xffffffff;
 
@@ -27,6 +27,7 @@ __inline__ __device__ float3 warpReduceSum (float valR, float valG, float valB)
     return make_float3 (valR, valG, valB);
 }
 
+// Run by the 32 threads of a warp
 __inline__ __device__ float3 blockReduceSum (float3 val)
 {
     static __shared__ float3 shared[32];    // Shared mem for 32 partial sums
@@ -51,28 +52,28 @@ __global__ void reduceit_arrays (float3* in, float3* out, int n_arrays, int n_el
     int omm_id = blockIdx.y * blockDim.y + threadIdx.y;
     // This gives a memory offset to get to the right part of the input memory
     int mem_offset = omm_id * n_elements;
-    // How many sums will be created for each array? This comes from x axis
+    // Number of sums is the number of 1D threadblocks that span n_elements. This is gridDim.x.
     int n_sums = gridDim.x;
 
     for (int i = blockIdx.x * blockDim.x + threadIdx.x;
          i < n_elements && omm_id < n_arrays;
-         i += blockDim.x * gridDim.x) {
-
+         i += blockDim.x * gridDim.x) { // skips 32 or 64
         sum.x += in[mem_offset + i].x;
         sum.y += in[mem_offset + i].y;
         sum.z += in[mem_offset + i].z;
     }
-    sum = blockReduceSum (sum);
 
-    int sum_id = blockIdx.x/32;
+    sum = blockReduceSum (sum); // not working. Something to do with warps?
+    __syncthreads();
+
+    //int sum_id = blockIdx.x/32;
 
     // Debug:
-    // sum.z = (float)sum_id; // omm_id * n_sums;
+    //sum.z = (float) blockIdx.x;
 
-    // Think about where that sum goes. out is n_arrays * n_sums
-    //if (threadIdx.x == 0 /*&& omm_id < n_arrays*/) {
+    // This gets the correct output location in out.
     if (threadIdx.x == 0 && omm_id < n_arrays) {
-        out[omm_id * n_sums + sum_id] = sum;
+        out[omm_id * n_sums + blockIdx.x] = sum;
     }
 }
 
@@ -83,24 +84,32 @@ __host__ void shufflesum_arrays (float3* in, int n_arrays, int n_elements, std::
 {
     // Working out the threads per block is the thing
 
-    // threadsperblock is the ideal size (512). warp size is 32.  So basic threadblock size should
-    // be 32 in x and 16 in y, giving 512 threads. If n_elements < 32 or n_arrays < 16, then some
-    // kind of padding should happen so that this works, even if it's slow.
-    dim3 threadblockdim(32, 16);
+    // threadsperblock is the ideal size (512). warp size is 32.  So basic threadblock
+    // size should be 32 in x and 16 in y, giving 512 threads. If n_elements < 32 or
+    // n_arrays < 16, then some kind of padding should happen so that this works, even
+    // if it's slow.  EXCEPT for the reduction, I can't mix memory values from different
+    // arrays in a threadblock, so the threadblock has to be 1D and thus configurable -
+    // dynamically sized to match the number of elements in the array.
+    int warps_for_n_elements = n_elements / 32;
+    int warps_extra = n_elements % 32;
+    int tbx = (warps_for_n_elements * 32) + (warps_extra ? 32 : 0);
+    tbx = std::min (tbx, threadsperblock);
+    dim3 threadblockdim(tbx, 1);
 
-    // So figure out how many threadblocks to run.
+    // Then figure out how many threadblocks to run.
     dim3 griddim(1, 1);
     griddim.x = n_elements / threadblockdim.x + (n_elements % threadblockdim.x ? 1 : 0);
     griddim.y = n_arrays / threadblockdim.y + (n_arrays % threadblockdim.y ? 1 : 0);
 
-    std::cout << "About to run with gridDim = (" << griddim.x << " x " << griddim.y << ") and blockDim = (32 x 16) thread blocks\n";
+    std::cout << "About to run with gridDim = (" << griddim.x << " x " << griddim.y
+              << ") and threadblockDim = (" << threadblockdim.x << " x " << threadblockdim.y << ") thread blocks\n";
 
     float3* d_output = nullptr;
     // Malloc n_arrays * n_sums (which is griddim.x) elements
     cudaMalloc (&d_output, griddim.x * n_arrays * 3 * sizeof(float));
 
     reduceit_arrays<<<griddim, threadblockdim>>>(in, d_output, n_arrays, n_elements);
-
+    cudaDeviceSynchronize();
     // I'll probably need a different stage 2
     //dim3 blks2(1, n_arrays, 1);
     //dim3 thrds2 = { 1024, 1, 1 };
@@ -126,17 +135,20 @@ int main()
     // This is the equivalent of the values in GPU ram that I need to average
     std::vector<float3> many_arrays_in_seq (arraysz);
 
-     for (int j = 0; j < number_of_arrays; ++j) {
+    float v1 = 0.0f;
+    float v2 = 0.0f;
+    float v3 = 0.0f;
+    for (int j = 0; j < number_of_arrays; ++j) {
         many_arrays[j].resize (elements_per_array, make_float3(0,0,0));
         float e = j % 2 == 0 ? j* 10.0f : -j* 10.0f;
         //std::cout << "For array " << j << " extra data = " << e << std::endl;
         for (int i = 0; i < elements_per_array; ++i) {
             if (i % 2 == 0) {
-               many_arrays[j][i] = make_float3 (0.12f+e, -0.23f+e, 0.34f+e);
+               many_arrays[j][i] = make_float3 (v1+e, -v2+e, v3+e);
             } else {
-                many_arrays[j][i] = make_float3 (-0.12f+e, 0.23f+e, -0.34f+e);
+                many_arrays[j][i] = make_float3 (-v1+e, v2+e, -v3+e);
             }
-            many_arrays_in_seq[j*elements_per_array + i] = many_arrays[j][i];
+            many_arrays_in_seq[j * elements_per_array + i] = many_arrays[j][i];
         }
     }
 
