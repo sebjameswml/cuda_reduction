@@ -57,19 +57,14 @@ __global__ void reduceit_arrays (float3* in, float3* out, int n_arrays, int n_el
 
     for (int i = blockIdx.x * blockDim.x + threadIdx.x;
          i < n_elements && omm_id < n_arrays;
-         i += blockDim.x * gridDim.x) { // skips 32 or 64
+         i += blockDim.x * gridDim.x) {
         sum.x += in[mem_offset + i].x;
         sum.y += in[mem_offset + i].y;
         sum.z += in[mem_offset + i].z;
     }
 
-    sum = blockReduceSum (sum); // not working. Something to do with warps?
+    sum = blockReduceSum (sum);
     __syncthreads();
-
-    //int sum_id = blockIdx.x/32;
-
-    // Debug:
-    //sum.z = (float) blockIdx.x;
 
     // This gets the correct output location in out.
     if (threadIdx.x == 0 && omm_id < n_arrays) {
@@ -80,7 +75,8 @@ __global__ void reduceit_arrays (float3* in, float3* out, int n_arrays, int n_el
 // Compute the sum of each of N-arrays arrays that are layed out one-after-another in the input
 // in. out should be the same size as in and is used when shuffle-computing the sums and also to
 // hold the results.
-__host__ void shufflesum_arrays (float3* in, int n_arrays, int n_elements, std::vector<float3>& sums)
+__host__ void shufflesum_arrays (float3* in, int n_arrays, int n_elements,
+                                 std::vector<float3>& sums, std::vector<float3>& final_sums)
 {
     // Working out the threads per block is the thing
 
@@ -90,40 +86,57 @@ __host__ void shufflesum_arrays (float3* in, int n_arrays, int n_elements, std::
     // if it's slow.  EXCEPT for the reduction, I can't mix memory values from different
     // arrays in a threadblock, so the threadblock has to be 1D and thus configurable -
     // dynamically sized to match the number of elements in the array.
-    int warps_for_n_elements = n_elements / 32;
+    int warps_base = n_elements / 32;
     int warps_extra = n_elements % 32;
-    int tbx = (warps_for_n_elements * 32) + (warps_extra ? 32 : 0);
+    int tbx = (warps_base * 32) + (warps_extra ? 32 : 0);
     tbx = std::min (tbx, threadsperblock);
-    dim3 threadblockdim(tbx, 1);
+    dim3 stg1_blockdim(tbx, 1);
 
     // Then figure out how many threadblocks to run.
-    dim3 griddim(1, 1);
-    griddim.x = n_elements / threadblockdim.x + (n_elements % threadblockdim.x ? 1 : 0);
-    griddim.y = n_arrays / threadblockdim.y + (n_arrays % threadblockdim.y ? 1 : 0);
+    dim3 stg1_griddim(1, 1);
+    stg1_griddim.x = n_elements / stg1_blockdim.x + (n_elements % stg1_blockdim.x ? 1 : 0);
+    stg1_griddim.y = n_arrays / stg1_blockdim.y + (n_arrays % stg1_blockdim.y ? 1 : 0);
 
-    std::cout << "About to run with gridDim = (" << griddim.x << " x " << griddim.y
-              << ") and threadblockDim = (" << threadblockdim.x << " x " << threadblockdim.y << ") thread blocks\n";
+    std::cout << "About to run with stg1_griddim = (" << stg1_griddim.x << " x " << stg1_griddim.y
+              << ") and stg1_blockdim = (" << stg1_blockdim.x << " x " << stg1_blockdim.y << ") thread blocks\n";
 
     float3* d_output = nullptr;
-    // Malloc n_arrays * n_sums (which is griddim.x) elements
-    cudaMalloc (&d_output, griddim.x * n_arrays * 3 * sizeof(float));
+    // Malloc n_arrays * n_sums (which is stg1_griddim.x) elements
+    cudaMalloc (&d_output, n_arrays * stg1_griddim.x * 3 * sizeof(float));
 
-    reduceit_arrays<<<griddim, threadblockdim>>>(in, d_output, n_arrays, n_elements);
+    reduceit_arrays<<<stg1_griddim, stg1_blockdim>>>(in, d_output, n_arrays, n_elements);
     cudaDeviceSynchronize();
-    // I'll probably need a different stage 2
-    //dim3 blks2(1, n_arrays, 1);
-    //dim3 thrds2 = { 1024, 1, 1 };
-    //reduceit_stage2<<<blks2, thrds2>>>(out_final, out, 1, blocks_x);
-    // out_final can be only n_arrays in size
 
-    // griddim.x is n_sums
-    sums.resize (griddim.x * n_arrays, make_float3(0,0,0));
-    std::cout << "resized sums to have size " << griddim.x << " * " << n_arrays << " = " << (griddim.x * n_arrays) << std::endl;
+    float3* d_final = nullptr;
+    // Malloc n_arrays elements for the final sums (or could re-use d_output)
+    cudaMalloc (&d_final, n_arrays * 3 * sizeof(float));
 
-    // Copy d_output into sums
+    // stg1_griddim.x is n_sums
+    sums.resize (stg1_griddim.x * n_arrays, make_float3(0,0,0));
+    std::cout << "resized sums to have size " << stg1_griddim.x << " * " << n_arrays << " = " << (stg1_griddim.x * n_arrays) << std::endl;
+    // Copy intermediate d_output into sums
     cudaMemcpy (sums.data(), d_output, sums.size() * 3 * sizeof(float), cudaMemcpyDeviceToHost);
 
+    // stg1_griddim.x is 'n_sums'
+    warps_base = stg1_griddim.x / 32;
+    warps_extra = stg1_griddim.x % 32;
+    tbx = (warps_base * 32) + (warps_extra ? 32 : 0);
+    tbx = std::min (tbx, threadsperblock);
+    dim3 stg2_blockdim(tbx, 1);
+    dim3 stg2_griddim(1, 1);
+    stg2_griddim.x = stg1_griddim.x / stg1_blockdim.x + (stg1_griddim.x % stg2_blockdim.x ? 1 : 0);
+    stg2_griddim.y = n_arrays / stg2_blockdim.y + (n_arrays % stg2_blockdim.y ? 1 : 0);
+
+    reduceit_arrays<<<stg2_griddim, stg2_blockdim>>>(d_output, d_final, n_arrays, stg1_griddim.x);
+    // out_final can be only n_arrays in size
+
+    final_sums.resize (n_arrays, make_float3(0,0,0));
+    std::cout << "resized final sums to have size " << n_arrays << " = " << n_arrays << std::endl;
+    // Copy intermediate d_output into sums
+    cudaMemcpy (final_sums.data(), d_final, final_sums.size() * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+
     cudaFree (d_output);
+    cudaFree (d_final);
 }
 
 int main()
@@ -169,8 +182,9 @@ int main()
     cudaMalloc (&d_many_arrays, arraysz * 3 * sizeof(float));
     cudaMemcpy (d_many_arrays, many_arrays_in_seq.data(), arraysz * 3 * sizeof(float), cudaMemcpyHostToDevice);
 
-    std::vector<float3> gpu_sums; // container for the sums
-    shufflesum_arrays (d_many_arrays, number_of_arrays, elements_per_array, gpu_sums); // resize gpu_sums in here
+    std::vector<float3> intermediate_sums; // container for intermediates (debug)
+    std::vector<float3> gpu_sums; // container for the final sums
+    shufflesum_arrays (d_many_arrays, number_of_arrays, elements_per_array, intermediate_sums, gpu_sums); // resize gpu_sums in here
 
     int num_sums = gpu_sums.size() / number_of_arrays;
     for (int i = 0; i < number_of_arrays; ++i) {
