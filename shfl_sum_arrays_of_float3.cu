@@ -195,7 +195,7 @@ int main()
         float e = j % 2 == 0 ? j * 0.1f + 0.01f : -j * 0.1f - 0.01f;
         for (int i = 0; i < elements_per_array; ++i) {
             if (i % 2 == 0) {
-               many_arrays[j][i] = make_float3 (v1+e, -v2+e, v3+e);
+                many_arrays[j][i] = make_float3 (v1+e, -v2+e, v3+e);
             } else {
                 many_arrays[j][i] = make_float3 (-v1+e, v2+e, -v3+e);
             }
