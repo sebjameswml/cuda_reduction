@@ -43,10 +43,10 @@ __inline__ __device__ float3 blockReduceSum (float3 val)
 __global__ void reduceit (float3* in, float3* out, int N)
 {
     float3 sum = make_float3(0.0f, 0.0f, 0.0f);
-    // reduce multiple elements per thread
-    // blockIdx.x * blockDim.x takes us along the array to our own thread block.
-    // Adding thread idx gets us to *the first memory location for this thread*; i.
-    // The other memory locations that this thread deals wtih are spaced by 1024 * 512 = 524288. N is 5242880, so for arrayblocks = 10240, this reduceit will loop 10 times here and add to the sum for 10 widely spaced locations.
+    // reduce multiple elements per thread blockIdx.x * blockDim.x takes us along the
+    // array to our own thread block.  Adding thread idx gets us to *the first memory
+    // location for this thread*; i.  (i += blockDim.x * gridDim.x) jumps past the
+    // memory that one threadblock will sum for, doing an initial, serial sum.
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += blockDim.x * gridDim.x) {
         sum.x += in[i].x;
         sum.y += in[i].y;

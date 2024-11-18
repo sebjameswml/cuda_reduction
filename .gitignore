@@ -2,3 +2,4 @@ prefix_sum
 shfl_sum_float
 shfl_sum_int
 shfl_sum_float3
+shfl_sum_arrays_of_float3
